@@ -1,0 +1,44 @@
+# # Python cache
+# __pycache__/
+# *.pyc
+
+# # VSCode
+# .vscode/
+
+# # W&B logs
+# wandb/
+
+# # Zarr data (huge!)
+# *.zarr/
+# *.ome.zarr/
+
+# # Model checkpoints and snapshots
+# snapshots/
+# *.pth
+# *.pt
+
+# # Large model folders (your hub/)
+# hub/
+
+# # Image output
+# *.tiff
+# *.png
+# *.jpg
+# *.jpeg
+
+# # Temporary files
+# *.log
+# *.tmp
+# .DS_Store
+# 忽略所有文件
+*
+
+# 但允许 .gitignore 本身
+!.gitignore
+
+# 允许 train.py 所在的整条路径
+!hub/
+!hub/models--ericwu09--ROSIE/
+!hub/models--ericwu09--ROSIE/snapshots/
+!hub/models--ericwu09--ROSIE/snapshots/main/
+!hub/models--ericwu09--ROSIE/snapshots/main/train.py
