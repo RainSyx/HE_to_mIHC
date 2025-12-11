@@ -1,0 +1,813 @@
+"""
+Training script for H&E to multiplex protein prediction model.
+
+This script trains a deep learning model to predict protein expression levels
+from H&E images. It supports both training and evaluation modes.
+
+Required directory structure:
+ROOT_DIR/
+    ├── data/                     # Contains training data
+    │   └── cell_measurements.pqt # Parquet file with cell measurements
+    ├── images/                   # H&E image data
+    │   └── {uuid}/image.ome.zarr # Zarr formatted image files  
+    ├── metadata/                 # Metadata files
+    │   └── metadata_dict.pkl     # Dictionary with experiment metadata
+    └── runs/                     # Training run outputs
+"""
+
+import os
+import shutil
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torchvision.models as models
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import pandas as pd
+import wandb
+from typing import Tuple, List, Dict, Optional
+import numpy as np
+from tqdm import tqdm
+from skimage.metrics import structural_similarity as ssim
+import torch.nn.functional as F
+from ome_zarr.io import parse_url
+from ome_zarr.reader import Reader
+
+# Configure torch multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+# Configuration constants
+ROOT_DIR = "/home/guoxs/Syx/ROISE/ROSIE_datatry"  # Base directory for project
+DATA_FILE = os.path.join(ROOT_DIR, "data/cell_measurements.pqt")
+METADATA_FILE = os.path.join(ROOT_DIR, "metadata/metadata_dict.pkl")
+IMAGE_DIR = os.path.join(ROOT_DIR, "images")
+
+# Model training constants
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-5
+EVAL_INTERVAL = 5
+PATIENCE = 50
+NUM_WORKERS = 0
+PATCH_SIZE = 128
+
+# Dataset splits for train/val/test
+DATASET_SPLITS = {
+    'train': [ "B2121081"
+        # TODO: Add training dataset splits
+    ],
+    'val': [ "B2155897"
+        # TODO: Add validation dataset splits
+    ],
+    'test': [ "B2155897"
+        # TODO: Add test dataset splits
+    ]
+}
+
+def pad_patch(patch: np.ndarray, 
+             original_size: Tuple[int, int], 
+             x_center: int, 
+             y_center: int, 
+             patch_size: int = PATCH_SIZE) -> np.ndarray:
+    """
+    Pads the given patch if its size is less than patch_size x patch_size pixels.
+
+    Args:
+        patch: NumPy array representing the patch image
+        original_size: Tuple of (width, height) of the original image
+        x_center: X coordinate of the center of the patch in the original image
+        y_center: Y coordinate of the center of the patch in the original image
+        patch_size: The target size of the patch
+
+    Returns:
+        Padded patch as a NumPy array
+    """
+    original_height, original_width = original_size
+    current_height, current_width = patch.shape[:2]
+    
+    if current_height == patch_size and current_width == patch_size:
+        return patch
+        
+    # Calculate padding needed
+    pad_left = max(patch_size // 2 - x_center, 0)
+    pad_right = max(x_center + patch_size // 2 - original_width, 0)
+    pad_top = max(patch_size // 2 - y_center, 0)
+    pad_bottom = max(y_center + patch_size // 2 - original_height, 0)
+
+    # Apply padding
+    pad_shape = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)) if patch.ndim == 3 else ((pad_top, pad_bottom), (pad_left, pad_right))
+    padded_patch = np.pad(patch, pad_shape, mode='constant', constant_values=0)
+
+    # Ensure the patch is exactly patch_size x patch_size
+    padded_patch = padded_patch[:patch_size, :patch_size]
+
+    return padded_patch
+
+def masked_mse_loss(pred: torch.Tensor, 
+                   target: torch.Tensor, 
+                   mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the mean squared error loss with a mask.
+
+    Args:
+        pred: Predicted tensor
+        target: Target tensor
+        mask: Mask tensor with 1s for elements to include and 0s to exclude
+
+    Returns:
+        Loss value
+    """
+    mask = mask.bool()
+    masked_pred = torch.masked_select(pred, mask)
+    masked_target = torch.masked_select(target, mask)
+    return F.mse_loss(masked_pred, masked_target, reduction='mean')
+
+def get_model(num_outputs: Optional[int] = None, 
+             use_context: bool = False, 
+             use_mask: bool = False) -> nn.Module:
+    """
+    Creates and returns the model architecture.
+
+    Args:
+        num_outputs: Number of output features to predict
+        use_context: Whether to use contextual features
+        use_mask: Whether to use masking in the model
+
+    Returns:
+        PyTorch model instance
+    """
+    model = models.convnext_small(weights='IMAGENET1K_V1')
+    model.classifier[2] = nn.Linear(model.classifier[2].in_features, num_outputs)
+    return model
+
+class ImageDataset(Dataset):
+    """
+    Dataset class for loading H&E image patches and their corresponding protein expression values.
+    
+    Args:
+        data_df: DataFrame containing cell measurements
+        root_dir: Root directory containing image data
+        is_test: Whether this is a test dataset
+        use_mask: Whether to use cell segmentation masks
+        transform: Transforms to apply to images
+        metadata_dict: Dictionary containing experiment metadata
+        test_acq_ids: List of acquisition IDs to use for testing
+        subset: Subset of coverslip IDs to use
+        pred_only: Whether to only generate predictions (no ground truth)
+    """
+    def __init__(self,
+                data_df: pd.DataFrame,
+                root_dir: str,
+                is_test: bool = False,
+                use_mask: bool = False,
+                transform: Optional[Dict] = None,
+                metadata_dict: Optional[Dict] = None,
+                test_acq_ids: Optional[List[str]] = None,
+                subset: Optional[List[str]] = None,
+                pred_only: bool = False):
+        
+        self.df = data_df
+        self.root_dir = root_dir
+        self.transform = transform
+        self.patch_size = PATCH_SIZE
+        self.ps = self.patch_size//2
+        self.metadata_dict = metadata_dict
+        self.use_mask = use_mask
+        self.invalid_acq_ids = set()
+        self.zarr_cache = {}
+        self.is_test = is_test
+        self.pred_only = pred_only
+
+        self.all_biomarkers = self.metadata_dict['all_biomarkers']
+        assert len(self.all_biomarkers) != 0, "No biomarker labels found"
+        
+        if subset is not None:
+            self.df = self.df[self.df['HE_COVERSLIP_ID'].isin(subset)]
+        if test_acq_ids is not None:
+            self.df = self.df[self.df['CODEX_ACQUISITION_ID'].isin(test_acq_ids)]
+            
+        self.df.reset_index(inplace=True)
+        self.acq_map = {i: x for i, x in enumerate(self.df['CODEX_ACQUISITION_ID'].unique())}
+        self.acq_map.update({x: i for i, x in enumerate(self.df['CODEX_ACQUISITION_ID'].unique())})
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> Optional[Tuple]:
+        """
+        Get a single item from the dataset.
+        
+        Args:
+            idx: Index of the item to get
+            
+        Returns:
+            Tuple containing (image_patch, expression_values, mask, metadata)
+            Returns None if the item is invalid
+        """
+
+        row = self.df.iloc[idx]
+        seg_acq_id = row['CODEX_ACQUISITION_ID']
+        he_region_uuid = self.metadata_dict[seg_acq_id]['HE_REGION_UUID']
+        he_region_path = os.path.join(IMAGE_DIR, he_region_uuid, 'image.ome.zarr')
+        
+        if he_region_path in self.invalid_acq_ids or not os.path.exists(he_region_path):
+            self.invalid_acq_ids.add(he_region_uuid)
+            return None
+
+        if self.use_mask and seg_acq_id in self.invalid_acq_ids:
+            return None
+
+        # Handle expression values
+        if self.pred_only:
+            exp_row = np.zeros(len(self.all_biomarkers))
+            nan_mask = np.zeros(len(self.all_biomarkers))
+            valid_mask = np.ones(len(self.all_biomarkers))
+            exp_vec = exp_row.astype(np.float32)
+        else:
+            exp_row = row[self.all_biomarkers]
+            nan_mask = exp_row.isnull().values
+            exp_row[nan_mask] = 0
+            valid_mask = ~nan_mask
+            exp_vec = exp_row.values.astype(np.float32)
+
+        # Get image patch coordinates
+        X, Y = row['X'], row['Y']
+        
+        # Handle segmentation masks if needed
+        if self.use_mask:
+            seg_path = os.path.join(self.root_dir, 'codex_segs', f'{seg_acq_id}.ome.zarr')
+            if not os.path.exists(seg_path):
+                self.invalid_acq_ids.add(seg_acq_id)
+                return None
+
+        # Load H&E image
+        if he_region_path in self.zarr_cache:
+            he_zarr = self.zarr_cache[he_region_path]
+        else:
+            # import pdb
+            # pdb.set_trace()
+            
+            he_zarr = [list(Reader(parse_url(he_region_path+f'/{i}', mode="r"))())[0].data[0].compute() 
+                      for i in range(3)]
+            self.zarr_cache[he_region_path] = he_zarr
+
+        # Extract patch
+        b = np.clip(Y-self.ps, 0, he_zarr[0].shape[0])
+        t = np.clip(Y+self.ps, 0, he_zarr[0].shape[0])
+        l = np.clip(X-self.ps, 0, he_zarr[0].shape[1])
+        r = np.clip(X+self.ps, 0, he_zarr[0].shape[1])
+        
+        he_patch = np.array([channel[b:t, l:r] for channel in he_zarr]).transpose(1, 2, 0)
+        he_patch = pad_patch(he_patch, he_zarr[0].shape, X, Y)
+        assert he_patch.shape == (128, 128, 3), f'H&E patch shape is {he_patch.shape}'
+
+        # Apply transforms
+        seed = np.random.randint(2**32)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        
+        if isinstance(self.transform, dict):
+            he_patch_pt = self.transform['all_channels'](he_patch)
+            patch = self.transform['image_only'](he_patch_pt)
+        else:
+            patch = self.transform(he_patch)
+        
+        # import pdb 
+        # pdb.set_trace()
+        
+        assert patch.shape == (3, 224, 224), f'Patch shape is {patch.shape}'
+
+        metadata = {
+            'CODEX_ACQUISITION_ID': seg_acq_id,
+            'X': X,
+            'Y': Y,
+            'HE_REGION_UUID': he_region_uuid
+        }
+
+        return patch, exp_vec, torch.from_numpy(valid_mask.astype(np.float32)),metadata
+
+
+# def evaluate(model: nn.Module,
+#             data_loader: DataLoader,
+#             device: torch.device,
+#             run_dir: str,
+#             step: int,
+#             bm_labels: List[str],
+#             acq_dict: Optional[Dict] = None,
+#             save_predictions: bool = False,
+#             pred_biomarkers: Optional[List[str]] = None) -> Optional[Tuple[float, float]]:
+#     """
+#     Evaluate the model on a dataset.
+    
+#     Args:
+#         model: The model to evaluate
+#         data_loader: DataLoader for the evaluation dataset
+#         device: Device to run evaluation on
+#         run_dir: Directory to save results
+#         step: Current training step
+#         bm_labels: List of biomarker labels
+#         acq_dict: Dictionary mapping acquisition IDs to metadata
+#         save_predictions: Whether to save predictions to disk
+#         pred_biomarkers: List of biomarkers to predict (if different from bm_labels)
+        
+#     Returns:
+#         None
+#     """
+#     model.eval()
+#     if pred_biomarkers is None:
+#         pred_biomarkers = bm_labels
+        
+#     try:
+#         acq_map = data_loader.dataset.acq_map
+#     except:
+#         acq_map = data_loader.dataset.dataset.acq_map
+    
+#     eval_dataset = []
+#     save_interval = 2000
+    
+#     with torch.no_grad():
+#         #for idx, (inputs, exp_vec, nan_mask, X, Y, indices) in tqdm(enumerate(data_loader)):
+#         for idx, (inputs, exp_vec, nan_mask, metadata) in tqdm(enumerate(data_loader)):
+#             if idx==63:
+#                 import pdb
+#                 pdb.set_trace()
+#             X = np.array([m for m in metadata['X']])
+#             Y = np.array([m for m in metadata['Y']])
+#             acq_ids = [m for m in metadata['CODEX_ACQUISITION_ID']]
+#             # import pdb
+#             # pdb.set_trace()
+#             inputs = inputs.to(device)
+#             outputs = model(inputs).detach().cpu().numpy()
+#             #indices = indices.numpy()
+#             exp_vec = exp_vec.numpy()
+            
+#             #acq_ids = [acq_map[x] for x in indices]
+#             rows = [[a,b,c]+list(d)+list(e) for a,b,c,d,e in zip(X, Y, acq_ids, outputs, exp_vec)]
+#             eval_dataset.extend(rows)
+            
+#             if save_predictions and idx % save_interval == 0:
+#                 temp_df = pd.DataFrame(eval_dataset, 
+#                                      columns=['X', 'Y', 'CODEX_ACQUISITION_ID'] + 
+#                                              [f'pred_{x}' for x in pred_biomarkers] + 
+#                                              [f'gt_{x}' for x in bm_labels])
+                
+#                 if os.path.exists(f'{run_dir}/predictions_{step}_{idx}.pqt'):
+#                     temp_df.to_parquet(f'{run_dir}/predictions_{step}_{idx}.pqt', 
+#                                      engine='fastparquet', append=True)
+#                 else:
+#                     temp_df.to_parquet(f'{run_dir}/predictions_{step}_{idx}.pqt')
+#                 eval_dataset = []
+
+#     eval_dataset = pd.DataFrame(eval_dataset, 
+#                               columns=['X', 'Y', 'CODEX_ACQUISITION_ID'] + 
+#                                       [f'pred_{x}' for x in pred_biomarkers] + 
+#                                       [f'gt_{x}' for x in bm_labels])
+
+#     if save_predictions:
+#         eval_dataset.to_parquet(f'{run_dir}/predictions_{step}.pqt')
+    
+#     return None
+
+def evaluate(model: nn.Module,
+            data_loader: DataLoader,
+            device: torch.device,
+            run_dir: str,
+            step: int,
+            bm_labels: List[str],
+            acq_dict: Optional[Dict] = None,
+            save_predictions: bool = False,
+            pred_biomarkers: Optional[List[str]] = None) -> Tuple[float, float]:
+    """
+    Evaluate the model on a dataset.
+
+    返回:
+        val_pr   - patch 级别的平均 Pearson R（跨 biomarker 平均）
+        val_ssim - 在重建 CODEX-like 图像上的平均 SSIM
+    """
+    model.eval()
+    if pred_biomarkers is None:
+        pred_biomarkers = bm_labels
+
+    # ---- 用于计算指标的累积容器 ----
+    all_preds = []       # [N, B]
+    all_targets = []     # [N, B]
+    all_valid = []       # [N, B] bool
+    all_x = []           # [N]
+    all_y = []           # [N]
+    all_acq_ids = []     # [N]，CODEX_ACQUISITION_ID
+
+    # ---- 用于可选保存 parquet 的缓存 ----
+    eval_rows = []
+    save_interval = 2000
+
+    with torch.no_grad():
+        for idx, (inputs, exp_vec, valid_mask, metadata) in enumerate(tqdm(data_loader)):
+            # DataLoader 默认会把 dict collate 成 {key: [batch 值]}
+            # if idx==63:
+            #     import pdb
+            #     pdb.set_trace()
+            X = np.array(metadata['X'])
+            Y = np.array(metadata['Y'])
+            acq_ids = np.array(metadata['CODEX_ACQUISITION_ID'])
+
+            inputs = inputs.to(device)
+            outputs = model(inputs).detach().cpu().numpy()   # [bs, B]
+            targets = exp_vec.numpy()                        # [bs, B]
+            valid_mask_np = valid_mask.numpy().astype(bool)  # [bs, B]
+
+            # ---- 累积到大数组里，之后统一算指标 ----
+            all_preds.append(outputs)
+            all_targets.append(targets)
+            all_valid.append(valid_mask_np)
+            all_x.append(X)
+            all_y.append(Y)
+            all_acq_ids.append(acq_ids)
+
+            # ---- 构造 DataFrame 行（如果要保存预测）----
+            rows = [[x, y, a] + list(pred_row) + list(gt_row)
+                    for x, y, a, pred_row, gt_row
+                    in zip(X, Y, acq_ids, outputs, targets)]
+            eval_rows.extend(rows)
+
+            # 分段写 parquet 防止内存爆
+            if save_predictions and (idx + 1) % save_interval == 0:
+                temp_df = pd.DataFrame(
+                    eval_rows,
+                    columns=['X', 'Y', 'CODEX_ACQUISITION_ID'] +
+                            [f'pred_{x}' for x in pred_biomarkers] +
+                            [f'gt_{x}' for x in bm_labels]
+                )
+                os.makedirs(run_dir, exist_ok=True)
+                out_path = os.path.join(run_dir, f'predictions_{step}_{idx}.pqt')
+                if os.path.exists(out_path):
+                    temp_df.to_parquet(out_path, engine='fastparquet', append=True)
+                else:
+                    temp_df.to_parquet(out_path)
+                eval_rows = []
+
+    # 如果 loader 里什么都没有，直接返回 NaN
+    if not all_preds:
+        return float('nan'), float('nan')
+
+    # import pdb
+    # pdb.set_trace()
+
+    #all_preds: a list of numpy (64,50), 64:batch_size, 50:biomarker_num
+
+    # ---- 把所有 batch 拼起来 ----
+    all_preds = np.concatenate(all_preds, axis=0)       # [N, B]
+    all_targets = np.concatenate(all_targets, axis=0)   # [N, B]
+    all_valid = np.concatenate(all_valid, axis=0)       # [N, B]
+    all_x = np.concatenate(all_x, axis=0)               # [N]
+    all_y = np.concatenate(all_y, axis=0)               # [N]
+    all_acq_ids = np.concatenate(all_acq_ids, axis=0)   # [N],the name of CODEX_ACQUISITION_ID
+
+    # import pdb
+    # pdb.set_trace()
+
+    # ---- 最后一块 parquet（如果需要保存）----
+    if save_predictions:
+        eval_dataset = pd.DataFrame(
+            eval_rows,
+            columns=['X', 'Y', 'CODEX_ACQUISITION_ID'] +
+                    [f'pred_{x}' for x in pred_biomarkers] +
+                    [f'gt_{x}' for x in bm_labels]
+        )
+        os.makedirs(run_dir, exist_ok=True)
+        out_path = os.path.join(run_dir, f'predictions_{step}.pqt')
+        eval_dataset.to_parquet(out_path)
+
+    # ===================== 1. 计算 Patch-level Pearson R =====================
+    # import pdb
+    # pdb.set_trace()
+    def _compute_patch_pearson(preds, targets, valid_mask):
+        """
+        preds, targets, valid_mask: [N, B]
+        对每个 biomarker j 计算 Pearson R，在 valid_mask[:, j] 为 True 的样本上。
+        最后对所有 biomarker 的 R 取平均。
+        """
+        N, B = targets.shape
+        rs = []
+        # import pdb
+        # pdb.set_trace()
+        for j in range(B):
+            mask_j = valid_mask[:, j]
+            if mask_j.sum() < 2:
+                continue
+            gt_j = targets[mask_j, j]
+            pred_j = preds[mask_j, j]
+            # 全常数就没法算相关系数，跳过
+            if gt_j.std() == 0 or pred_j.std() == 0:
+                continue
+            r = np.corrcoef(gt_j, pred_j)[0, 1]
+            if np.isfinite(r):
+                rs.append(r)
+        if not rs:
+            return float('nan')
+        return float(np.mean(rs))
+    # import pdb
+    # pdb.set_trace()
+    val_pr = _compute_patch_pearson(all_preds, all_targets, all_valid)
+
+    # ===================== 2. 计算重建图像上的 SSIM =====================
+    # import pdb
+    # pdb.set_trace()
+    def _compute_image_ssim(preds, targets, valid_mask, xs, ys, acq_ids, downscale: int = 1):
+        """
+        使用 X/Y 坐标和 CODEX_ACQUISITION_ID 把 patch 表达值撒回 2D 网格，
+        对每个 acquisition + biomarker 计算一对 (gt_img, pred_img) 的 SSIM。
+
+        downscale > 1 时会对坐标做整除下采样，用于控制图像尺寸（如果内存吃紧可以改成 2、4 之类）。
+        """
+        xs = xs.astype(np.int64)
+        ys = ys.astype(np.int64)
+        acq_ids = np.asarray(acq_ids)
+        N, B = targets.shape
+        ssim_vals = []
+        # import pdb
+        # pdb.set_trace()
+        for acq in np.unique(acq_ids):
+            idx_acq = np.where(acq_ids == acq)[0]
+            if idx_acq.size == 0:
+                continue
+
+            xs_acq = xs[idx_acq]
+            ys_acq = ys[idx_acq]
+            preds_acq = preds[idx_acq]
+            targets_acq = targets[idx_acq]
+            valid_acq = valid_mask[idx_acq]
+
+            # 平移到从 0 开始，并可选下采样
+            xs0 = xs_acq - xs_acq.min()
+            ys0 = ys_acq - ys_acq.min()
+            if downscale > 1:
+                xs0 = xs0 // downscale
+                ys0 = ys0 // downscale
+
+            H = int(ys0.max() + 1)
+            W = int(xs0.max() + 1)
+            if H <= 1 or W <= 1:
+                continue
+            # import pdb
+            # pdb.set_trace()
+            for j in range(B):
+                vmask = valid_acq[:, j]
+                if vmask.sum() < 2:
+                    continue
+
+                img_pred = np.zeros((H, W), dtype=np.float32)
+                img_gt = np.zeros((H, W), dtype=np.float32)
+
+                yj = ys0[vmask]
+                xj = xs0[vmask]
+                v_pred = preds_acq[vmask, j]
+                v_gt = targets_acq[vmask, j]
+
+                img_pred[yj, xj] = v_pred
+                img_gt[yj, xj] = v_gt #save the gt image and pred image to compare
+
+                data_range = float(img_gt.max() - img_gt.min())
+                if data_range <= 0:
+                    continue
+
+                s = ssim(img_gt, img_pred, data_range=data_range)
+                if np.isfinite(s):
+                    ssim_vals.append(s)
+
+        if not ssim_vals:
+            return float('nan')
+        return float(np.mean(ssim_vals))
+    
+    # import pdb
+    # pdb.set_trace()
+    # 如果觉得图像太大，可以把 downscale 改成 2 / 4
+    val_ssim = _compute_image_ssim(
+        all_preds, all_targets, all_valid, all_x, all_y, all_acq_ids, downscale=1
+    )
+
+    return val_pr, val_ssim
+
+
+def main():
+    """Main training and evaluation function."""
+    
+    # Initialize wandb for experiment tracking
+    wandb.init(project='hande_to_codex', name='model_training')
+
+    # Set up data transforms
+    transform_train = {
+        'all_channels': transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.Resize(224, antialias=True),
+            transforms.RandomRotation(degrees=(-10, 10)),
+        ]),
+        'image_only': transforms.Compose([
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    }
+
+    transform_eval = {
+        'all_channels': transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize(224, antialias=True),
+        ]),
+        'image_only': transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    }
+
+    # Load metadata and data
+    metadata_dict = pd.read_pickle(METADATA_FILE)
+    data_df = pd.read_parquet(DATA_FILE)
+
+    # # --- Debug prints to inspect data and splits ---
+    # print("ROOT_DIR:", ROOT_DIR)
+    # print("IMAGE_DIR:", IMAGE_DIR)
+    # print("METADATA_FILE:", METADATA_FILE)
+    # print("DATA_FILE:", DATA_FILE)
+    # print("DATASET_SPLITS:", DATASET_SPLITS)
+    # print()
+
+    # # show keys in metadata_dict
+    # print("metadata_dict keys (sample 10):", list(metadata_dict.keys())[:10])
+    # print("all_biomarkers:", metadata_dict.get('all_biomarkers', [])[:10])
+    # print()
+
+    # # show data_df basic info
+    # print("data_df shape:", data_df.shape)
+    # print("data_df columns:", data_df.columns.tolist())
+    # if 'HE_COVERSLIP_ID' in data_df.columns:
+    #     print("Unique HE_COVERSLIP_ID (sample 20):", data_df['HE_COVERSLIP_ID'].unique()[:20])
+    # if 'CODEX_ACQUISITION_ID' in data_df.columns:
+    #     print("Unique CODEX_ACQUISITION_ID (sample 20):", data_df['CODEX_ACQUISITION_ID'].unique()[:20])
+    # print()
+    # # check intersection between your subset strings and data_df[HE_COVERSLIP_ID]
+    # for split_name, ids in DATASET_SPLITS.items():
+    #     if len(ids) == 0:
+    #         print(f"{split_name} : EMPTY list in DATASET_SPLITS")
+    #         continue
+    #     # intersection with HE_COVERSLIP_ID
+    #     if 'HE_COVERSLIP_ID' in data_df.columns:
+    #         inter = set(ids).intersection(set(data_df['HE_COVERSLIP_ID'].unique()))
+    #         print(f"{split_name} - subset count in HE_COVERSLIP_ID: {len(inter)} / {len(ids)} ; matches: {list(inter)[:10]}")
+    #     # intersection with metadata_dict values (HE_REGION_UUID)
+    #     # build set of HE_REGION_UUIDs from metadata_dict values if available
+    #     he_region_uuids = set()
+    #     for k,v in metadata_dict.items():
+    #         try:
+    #             he_region_uuids.add(v.get('HE_REGION_UUID'))
+    #         except:
+    #             pass
+    #     inter2 = set(ids).intersection(he_region_uuids)
+    #     print(f"{split_name} - subset count in metadata HE_REGION_UUID: {len(inter2)} / {len(ids)} ; matches: {list(inter2)[:10]}")
+    # print("---------")
+
+
+    
+    # Create datasets
+    # import pdb 
+    # pdb.set_trace()
+    train_dataset = ImageDataset(
+        data_df=data_df,
+        root_dir=ROOT_DIR,
+        transform=transform_train,
+        metadata_dict=metadata_dict,
+        subset=DATASET_SPLITS['train']
+    )
+
+    val_dataset = ImageDataset(
+        data_df=data_df,
+        root_dir=ROOT_DIR,
+        transform=transform_eval,
+        metadata_dict=metadata_dict,
+        subset=DATASET_SPLITS['val'],
+        is_test=True
+    )
+
+    # Create data loaders
+    def collate_fn(batch):
+        batch = list(filter(lambda x: x is not None, batch))
+        return torch.utils.data.default_collate(batch)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE * 4,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn
+    )
+
+    # Set up model and training
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = get_model(num_outputs=len(metadata_dict['all_biomarkers']))
+    
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    
+    model = model.to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10, verbose=True)
+    criterion = masked_mse_loss
+
+    # Training loop
+    step = 0
+    best_val_score = 0
+    steps_since_best_val_score = 0
+
+    while True:
+        model.train()
+        for inputs, labels, mask, _ in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            mask = mask.to(device)
+            # import pdb
+            # pdb.set_trace()
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels, mask)
+
+            if step % 10 == 0:  # 每10步打印一次
+                print(f"[Step {step}] Loss = {loss.item():.6f}")
+            
+            if torch.isnan(loss):
+                print(f"[Step {step}] Warning: Loss is NaN, skipping batch")
+                continue
+                
+            loss.backward()
+            optimizer.step()
+
+            if step % 100 == 0:
+                wandb.log({'train_loss': loss.item()})
+
+            # Validation
+            if step % EVAL_INTERVAL == 0:
+                # import pdb
+                # pdb.set_trace()
+                # val_r2, val_ssim = evaluate(
+                #     model, val_loader, device, 
+                #     os.path.join(ROOT_DIR, 'runs'), 
+                #     step, metadata_dict['all_biomarkers']
+                # )
+                
+                # val_score = val_r2 + val_ssim
+                # wandb.log({
+                #     'val_r2': val_r2,
+                #     'val_ssim': val_ssim,
+                #     'val_score': val_score
+                # })
+
+                val_r2, val_ssim = evaluate(
+                    model, val_loader, device, 
+                    os.path.join(ROOT_DIR, 'runs'), 
+                    step, metadata_dict['all_biomarkers']
+                )
+
+                # 防止 NaN 影响 early stopping 和 scheduler
+                if np.isnan(val_r2):
+                    val_r2 = 0.0
+                if np.isnan(val_ssim):
+                    val_ssim = 0.0
+
+                val_score = val_r2 + val_ssim
+
+                print(f"[Step {step}] val_r2 (Pearson R) = {val_r2:.4f}, val_ssim = {val_ssim:.4f}, val_score = {val_score:.4f}")
+
+                wandb.log({
+                    'val_r2': val_r2,
+                    'val_ssim': val_ssim,
+                    'val_score': val_score
+                })
+
+
+                # Save best model
+                if val_score > best_val_score:
+                    best_val_score = val_score
+                    torch.save(model.state_dict(), os.path.join(ROOT_DIR, 'runs', 'best_model.pth'))
+                    steps_since_best_val_score = 0
+                else:
+                    steps_since_best_val_score += EVAL_INTERVAL
+
+                scheduler.step(val_score)
+
+                # Early stopping check
+                if steps_since_best_val_score >= PATIENCE:
+                    print(f'Early stopping after {step} steps')
+                    return
+
+            step += 1
+
+if __name__ == '__main__':
+    main()
