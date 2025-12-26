@@ -20,7 +20,7 @@ from ome_zarr.io import parse_url
 from ome_zarr.reader import Reader
 import tifffile
 import argparse
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from pathlib import Path
 import pdb
 from PIL import Image
@@ -95,6 +95,52 @@ def normalize_image(image, min_value, max_value):
         Normalized image as uint8
     """
     return ((image - min_value)*255./(max_value - min_value)).astype(np.uint8)
+
+def get_available_gpus() -> List[int]:
+    """
+    检测并返回可用的GPU设备列表。
+    会测试每个GPU是否可以正常使用，过滤掉有问题的GPU。
+    
+    Returns:
+        可用GPU设备ID的列表
+    """
+    available_gpus = []
+    
+    if not torch.cuda.is_available():
+        print("CUDA不可用，将使用CPU")
+        return available_gpus
+    
+    try:
+        num_gpus = torch.cuda.device_count()
+        print(f"检测到 {num_gpus} 个GPU设备")
+        
+        for gpu_id in range(num_gpus):
+            try:
+                # 尝试在每个GPU上创建一个tensor来测试
+                torch.cuda.set_device(gpu_id)
+                test_tensor = torch.zeros(1).cuda()
+                del test_tensor
+                torch.cuda.empty_cache()
+                
+                # 获取GPU名称
+                gpu_name = torch.cuda.get_device_name(gpu_id)
+                print(f"  GPU {gpu_id}: {gpu_name} - 可用 ✓")
+                available_gpus.append(gpu_id)
+                
+            except Exception as e:
+                print(f"  GPU {gpu_id}: 不可用 ✗ (错误: {str(e)})")
+                continue
+                
+    except Exception as e:
+        print(f"检测GPU时出错: {str(e)}")
+    
+    if available_gpus:
+        print(f"将使用以下GPU: {available_gpus}")
+    else:
+        print("没有可用的GPU，将使用CPU")
+    
+    return available_gpus
+
 
 def get_model(num_outputs: int) -> nn.Module:
     """Creates and returns the model architecture."""
@@ -385,18 +431,77 @@ def main():
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Set up device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 检测可用的GPU
+    available_gpus = get_available_gpus()
     
-    # Load model
-    num_channels = 50
-    model = get_model(num_outputs=num_channels)
-    #pdb.set_trace()
-    # if torch.cuda.device_count() > 1:
-    #     print("Using", torch.cuda.device_count(), "GPUs")
-    model = nn.DataParallel(model)
-    # pdb.set_trace()
-    model.load_state_dict(torch.load(args.model_path)['model_state_dict'])
+    # Set up device
+    if available_gpus:
+        # 使用第一个可用GPU作为主设备
+        device = torch.device(f'cuda:{available_gpus[0]}')
+        print(f"使用设备: {device}")
+        
+        # 如果有多个可用GPU，使用DataParallel
+        num_channels = 50
+        model = get_model(num_outputs=num_channels)
+        if len(available_gpus) > 1:
+            model = nn.DataParallel(model, device_ids=available_gpus)
+            print(f"使用DataParallel，GPU设备: {available_gpus}")
+        else:
+            # 确保模型在正确的GPU上
+            torch.cuda.set_device(available_gpus[0])
+    else:
+        # 没有可用GPU，使用CPU
+        device = torch.device('cpu')
+        print("没有可用GPU，使用CPU")
+        num_channels = 50
+        model = get_model(num_outputs=num_channels)
+    
+    
+    # state_dict = torch.load(args.model_path, map_location=device)
+    # from collections import OrderedDict
+    # new_state_dict = OrderedDict()
+
+    # for k, v in state_dict.items():
+    #     # 如果 key 以 'module.' 开头，去掉它
+    #     name = k[7:] if k.startswith('module.') else k 
+    #     new_state_dict[name] = v
+
+    # model.load_state_dict(new_state_dict)
+    # model.load_state_dict(torch.load(args.model_path, map_location=device))
+    # state_dict = torch.load(args.model_path, map_location=device)
+
+    # 1. 加载整个 Checkpoint 文件
+    checkpoint = torch.load(args.model_path, map_location=device)
+
+    # 2. 提取真正的模型权重
+    # 你的报错显示权重被保存在 "model_state_dict" 这个 key 下
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        # 兼容旧版本：如果直接保存的是 state_dict
+        state_dict = checkpoint
+
+    # 3. 处理 DataParallel 留下的 "module." 前缀
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+
+    for k, v in state_dict.items():
+        # 如果 key 以 'module.' 开头，去掉这 7 个字符
+        name = k[7:] if k.startswith('module.') else k 
+        new_state_dict[name] = v
+
+    # 4. 加载处理后的权重
+    try:
+        model.load_state_dict(new_state_dict)
+        print("✓ 模型权重加载成功！")
+    except RuntimeError as e:
+        print(f"❌ 加载失败，请检查模型架构是否匹配。\n详细错误: {e}")
+        exit(1)
+    
+
+    
+    
+
     model = model.to(device)
     
     # Check if input_dir is a file or directory

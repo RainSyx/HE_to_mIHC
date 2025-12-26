@@ -17,6 +17,22 @@ ROOT_DIR/
 
 import os
 import shutil
+
+# 在导入torch之前设置CUDA环境
+# 确保conda环境的库路径优先
+conda_env = os.environ.get('CONDA_PREFIX', '/NAS/guoxs/miniconda3/envs/SyxROISE')
+if 'LD_LIBRARY_PATH' not in os.environ or conda_env not in os.environ.get('LD_LIBRARY_PATH', ''):
+    conda_lib = f"{conda_env}/lib"
+    cuda_cupti = "/usr/local/cuda-12.0/extras/CUPTI/lib64"
+    cuda_lib = "/usr/local/cuda-12.0/lib64"
+    current_ld = os.environ.get('LD_LIBRARY_PATH', '')
+    os.environ['LD_LIBRARY_PATH'] = f"{conda_lib}:{cuda_cupti}:{cuda_lib}:{current_ld}"
+
+# 设置CUDA_VISIBLE_DEVICES（如果未设置，默认使用0,2,3，排除有问题的GPU 1和4）
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,2,3'
+    print(f"自动设置 CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} (排除有问题的GPU)")
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -33,6 +49,9 @@ from skimage.metrics import structural_similarity as ssim
 import torch.nn.functional as F
 from ome_zarr.io import parse_url
 from ome_zarr.reader import Reader
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
 
 # Configure torch multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -44,16 +63,17 @@ METADATA_FILE = os.path.join(ROOT_DIR, "metadata/metadata_dict.pkl")
 IMAGE_DIR = os.path.join(ROOT_DIR, "images")
 
 # Model training constants
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 LEARNING_RATE = 1e-5
-EVAL_INTERVAL = 5
-PATIENCE = 50
+EVAL_INTERVAL = 50
+PATIENCE = 500
+# GPU与驱动已恢复，开启多进程数据加载
 NUM_WORKERS = 0
 PATCH_SIZE = 128
 
 # Dataset splits for train/val/test
 DATASET_SPLITS = {
-    'train': [ "B2121081"
+    'train': [ "B2121081","B2155897"
         # TODO: Add training dataset splits
     ],
     'val': [ "B2155897"
@@ -368,6 +388,13 @@ class ImageDataset(Dataset):
     
 #     return None
 
+# --- 请确保添加这个辅助函数 (放在 evaluate 函数之前) ---
+def get_gaussian_kernel(kernel_size=16, sigma=4.0):
+    """生成用于平滑拼接的高斯核"""
+    x, y = np.mgrid[-kernel_size//2:kernel_size//2, -kernel_size//2:kernel_size//2]
+    g = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    return g
+
 def evaluate(model: nn.Module,
             data_loader: DataLoader,
             device: torch.device,
@@ -376,7 +403,9 @@ def evaluate(model: nn.Module,
             bm_labels: List[str],
             acq_dict: Optional[Dict] = None,
             save_predictions: bool = False,
-            pred_biomarkers: Optional[List[str]] = None) -> Tuple[float, float]:
+            pred_biomarkers: Optional[List[str]] = None,
+            save_visualizations: bool = True,
+            num_biomarkers_to_viz: int = 6) -> Tuple[float, float]:
     """
     Evaluate the model on a dataset.
 
@@ -509,23 +538,237 @@ def evaluate(model: nn.Module,
     # pdb.set_trace()
     val_pr = _compute_patch_pearson(all_preds, all_targets, all_valid)
 
-    # ===================== 2. 计算重建图像上的 SSIM =====================
-    # import pdb
-    # pdb.set_trace()
-    def _compute_image_ssim(preds, targets, valid_mask, xs, ys, acq_ids, downscale: int = 1):
-        """
-        使用 X/Y 坐标和 CODEX_ACQUISITION_ID 把 patch 表达值撒回 2D 网格，
-        对每个 acquisition + biomarker 计算一对 (gt_img, pred_img) 的 SSIM。
+    # # ===================== 2. 计算重建图像上的 SSIM =====================
+    # # import pdb
+    # # pdb.set_trace()
+    # def _compute_image_ssim(preds, targets, valid_mask, xs, ys, acq_ids, downscale: int = 1):
+    #     """
+    #     使用 X/Y 坐标和 CODEX_ACQUISITION_ID 把 patch 表达值撒回 2D 网格，
+    #     对每个 acquisition + biomarker 计算一对 (gt_img, pred_img) 的 SSIM。
 
-        downscale > 1 时会对坐标做整除下采样，用于控制图像尺寸（如果内存吃紧可以改成 2、4 之类）。
+    #     downscale > 1 时会对坐标做整除下采样，用于控制图像尺寸（如果内存吃紧可以改成 2、4 之类）。
+        
+    #     返回:
+    #         ssim_vals: SSIM值列表
+    #         images_for_viz: 用于可视化的图像字典 {acq_id: {biomarker_idx: (img_pred, img_gt)}}
+    #     """
+    #     xs = xs.astype(np.int64)
+    #     ys = ys.astype(np.int64)
+    #     acq_ids = np.asarray(acq_ids)
+    #     N, B = targets.shape
+    #     ssim_vals = []
+    #     images_for_viz = {}  # {acq_id: {biomarker_idx: (img_pred, img_gt, ssim_val)}}
+        
+    #     # import pdb
+    #     # pdb.set_trace()
+    #     for acq in np.unique(acq_ids):
+    #         idx_acq = np.where(acq_ids == acq)[0]
+    #         if idx_acq.size == 0:
+    #             continue
+
+    #         xs_acq = xs[idx_acq]
+    #         ys_acq = ys[idx_acq]
+    #         preds_acq = preds[idx_acq]
+    #         targets_acq = targets[idx_acq]
+    #         valid_acq = valid_mask[idx_acq]
+
+    #         # 平移到从 0 开始，并可选下采样
+    #         xs0 = xs_acq - xs_acq.min()
+    #         ys0 = ys_acq - ys_acq.min()
+    #         if downscale > 1:
+    #             xs0 = xs0 // downscale
+    #             ys0 = ys0 // downscale
+
+    #         H = int(ys0.max() + 1)
+    #         W = int(xs0.max() + 1)
+    #         if H <= 1 or W <= 1:
+    #             continue
+            
+    #         images_for_viz[acq] = {}
+            
+    #         # import pdb
+    #         # pdb.set_trace()
+    #         for j in range(B):
+    #             vmask = valid_acq[:, j]
+    #             if vmask.sum() < 2:
+    #                 continue
+
+    #             img_pred = np.zeros((H, W), dtype=np.float32)
+    #             img_gt = np.zeros((H, W), dtype=np.float32)
+
+    #             yj = ys0[vmask]
+    #             xj = xs0[vmask]
+    #             v_pred = preds_acq[vmask, j]
+    #             v_gt = targets_acq[vmask, j]
+
+    #             img_pred[yj, xj] = v_pred
+    #             img_gt[yj, xj] = v_gt
+
+    #             data_range = float(img_gt.max() - img_gt.min())
+    #             if data_range <= 0:
+    #                 continue
+
+    #             s = ssim(img_gt, img_pred, data_range=data_range)
+    #             if np.isfinite(s):
+    #                 ssim_vals.append(s)
+    #                 images_for_viz[acq][j] = (img_pred.copy(), img_gt.copy(), s)
+
+    #     if not ssim_vals:
+    #         return float('nan'), {}
+    #     return float(np.mean(ssim_vals)), images_for_viz
+    
+    # # import pdb
+    # # pdb.set_trace()
+    # # 如果觉得图像太大，可以把 downscale 改成 2 / 4
+    # val_ssim, images_for_viz = _compute_image_ssim(
+    #     all_preds, all_targets, all_valid, all_x, all_y, all_acq_ids, downscale=1
+    # )
+    
+    # # ===================== 3. 保存可视化图像 =====================
+    # if save_visualizations and images_for_viz:
+    #     viz_dir = os.path.join(run_dir, 'visualizations_all_biomarkers', f'step_{step}')
+    #     os.makedirs(viz_dir, exist_ok=True)
+        
+    #     for acq_id, acq_images in images_for_viz.items():
+    #         # 为每个acquisition创建可视化
+    #         if len(acq_images) == 0:
+    #             continue
+            
+    #         # 如果num_biomarkers_to_viz为-1，可视化所有biomarker
+    #         if num_biomarkers_to_viz == -1:
+    #             biomarkers_to_viz = sorted(acq_images.keys())
+    #         else:
+    #             biomarkers_to_viz = list(range(min(num_biomarkers_to_viz, len(bm_labels))))
+            
+    #         # 选择有效的biomarker
+    #         valid_biomarker_indices = [j for j in biomarkers_to_viz if j in acq_images]
+    #         if not valid_biomarker_indices:
+    #             continue
+            
+    #         # 计算全局归一化范围（用于统一显示所有biomarker）
+    #         # 收集所有pred和GT的值范围
+    #         all_pred_values = []
+    #         all_gt_values = []
+    #         for j in valid_biomarker_indices:
+    #             img_pred, img_gt, _ = acq_images[j]
+    #             all_pred_values.extend(img_pred[img_pred > 0].flatten())  # 只统计非零值
+    #             all_gt_values.extend(img_gt[img_gt > 0].flatten())
+            
+    #         # 使用百分位数进行归一化，避免异常值影响
+    #         pred_min = np.percentile(all_pred_values, 1) if all_pred_values else 0
+    #         pred_max = np.percentile(all_pred_values, 99) if all_pred_values else 1
+    #         gt_min = np.percentile(all_gt_values, 1) if all_gt_values else 0
+    #         gt_max = np.percentile(all_gt_values, 99) if all_gt_values else 1
+            
+    #         # 创建figure，每个biomarker一行，包含pred和GT并排显示
+    #         # 如果biomarker太多，分成多个文件
+    #         max_biomarkers_per_file = 12  # 每个文件最多显示12个biomarker
+    #         num_files = (len(valid_biomarker_indices) + max_biomarkers_per_file - 1) // max_biomarkers_per_file
+            
+    #         for file_idx in range(num_files):
+    #             start_idx = file_idx * max_biomarkers_per_file
+    #             end_idx = min(start_idx + max_biomarkers_per_file, len(valid_biomarker_indices))
+    #             current_biomarkers = valid_biomarker_indices[start_idx:end_idx]
+                
+    #             # 每个biomarker一行，两列（Pred和GT）
+    #             fig, axes = plt.subplots(len(current_biomarkers), 2, 
+    #                                     figsize=(12, 4 * len(current_biomarkers)))
+    #             if len(current_biomarkers) == 1:
+    #                 axes = axes.reshape(1, -1)
+                
+    #             for row_idx, j in enumerate(current_biomarkers):
+    #                 img_pred, img_gt, ssim_val = acq_images[j]
+    #                 biomarker_name = bm_labels[j] if j < len(bm_labels) else f'Biomarker_{j}'
+                    
+    #                 # 归一化：使用全局范围进行归一化，然后clip到[0,1]
+    #                 def normalize_with_range(img, vmin, vmax):
+    #                     """使用给定的范围归一化图像"""
+    #                     if vmax > vmin:
+    #                         img_norm = (img - vmin) / (vmax - vmin)
+    #                         img_norm = np.clip(img_norm, 0, 1)
+    #                     else:
+    #                         # 如果范围无效，使用局部归一化
+    #                         if img.max() > img.min():
+    #                             img_norm = (img - img.min()) / (img.max() - img.min())
+    #                         else:
+    #                             img_norm = np.zeros_like(img)
+    #                     return img_norm
+                    
+    #                 # 对每个图像，优先使用全局范围，如果该图像范围超出全局范围则使用局部归一化
+    #                 pred_vmin = min(pred_min, img_pred[img_pred > 0].min() if np.any(img_pred > 0) else pred_min)
+    #                 pred_vmax = max(pred_max, img_pred.max() if np.any(img_pred > 0) else pred_max)
+    #                 gt_vmin = min(gt_min, img_gt[img_gt > 0].min() if np.any(img_gt > 0) else gt_min)
+    #                 gt_vmax = max(gt_max, img_gt.max() if np.any(img_gt > 0) else gt_max)
+                    
+    #                 img_pred_norm = normalize_with_range(img_pred, pred_vmin, pred_vmax)
+    #                 img_gt_norm = normalize_with_range(img_gt, gt_vmin, gt_vmax)
+                    
+    #                 # 预测图（灰度图）
+    #                 im1 = axes[row_idx, 0].imshow(img_pred_norm, cmap='gray', interpolation='nearest', vmin=0, vmax=1)
+    #                 axes[row_idx, 0].set_title(f'Prediction: {biomarker_name}\nSSIM: {ssim_val:.4f}', 
+    #                                            fontsize=10, fontweight='bold')
+    #                 axes[row_idx, 0].axis('off')
+                    
+    #                 # GT图（灰度图）
+    #                 im2 = axes[row_idx, 1].imshow(img_gt_norm, cmap='gray', interpolation='nearest', vmin=0, vmax=1)
+    #                 axes[row_idx, 1].set_title(f'Ground Truth: {biomarker_name}', 
+    #                                            fontsize=10, fontweight='bold')
+    #                 axes[row_idx, 1].axis('off')
+                
+    #             # 添加说明
+    #             file_suffix = f"_part{file_idx+1}" if num_files > 1 else ""
+    #             title = f'Protein Expression Visualization - {acq_id} (Step {step})\n'
+    #             title += f'Biomarkers {start_idx+1}-{end_idx} of {len(valid_biomarker_indices)} | '
+    #             title += f'Each point represents average of 8×8 patch | Global avg SSIM: {val_ssim:.4f}'
+                
+    #             plt.suptitle(title, fontsize=11, y=0.995)
+    #             plt.tight_layout(rect=[0, 0, 1, 0.98])
+                
+    #             # 保存图像
+    #             save_path = os.path.join(viz_dir, f'{acq_id}_grayscale{file_suffix}.png')
+    #             plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    #             plt.close()
+                
+    #             print(f"  已保存灰度可视化: {save_path}")
+            
+    #         # 额外保存一个所有biomarker的平均SSIM信息文件
+    #         all_ssims = [acq_images[j][2] for j in valid_biomarker_indices]
+    #         avg_ssim = np.mean(all_ssims) if all_ssims else 0.0
+    #         info_path = os.path.join(viz_dir, f'{acq_id}_ssim_info.txt')
+    #         with open(info_path, 'w') as f:
+    #             f.write(f"Acquisition: {acq_id}\n")
+    #             f.write(f"Step: {step}\n")
+    #             f.write(f"Number of biomarkers visualized: {len(valid_biomarker_indices)}\n")
+    #             f.write(f"Average SSIM (this acquisition, visualized biomarkers): {avg_ssim:.4f}\n")
+    #             f.write(f"Global average SSIM (all acquisitions, all biomarkers): {val_ssim:.4f}\n")
+    #             f.write("\nPer-biomarker SSIM:\n")
+    #             for j in valid_biomarker_indices:
+    #                 biomarker_name = bm_labels[j] if j < len(bm_labels) else f'Biomarker_{j}'
+    #                 ssim_val = acq_images[j][2]
+    #                 f.write(f"  {biomarker_name}: {ssim_val:.4f}\n")
+
+    
+    # ===================== 2. 计算重建图像上的 SSIM (使用高斯平滑重建) =====================
+    def _compute_image_ssim(preds, targets, valid_mask, xs, ys, acq_ids, 
+                          stride: int = 8, kernel_size: int = 16):
         """
+        使用高斯加权融合将稀疏的预测点重建为全尺寸平滑灰度图像，并计算 SSIM。
+        原理类似 evaluate.py 的 process_image，但针对的是点状数据。
+        """
+        # 确保坐标是整数
         xs = xs.astype(np.int64)
         ys = ys.astype(np.int64)
         acq_ids = np.asarray(acq_ids)
+        
         N, B = targets.shape
         ssim_vals = []
-        # import pdb
-        # pdb.set_trace()
+        images_for_viz = {} 
+        
+        # 预计算高斯核 (kernel_size 建议设为 2 * stride 以保证覆盖)
+        # sigma 设为 kernel_size / 4 可以保证边缘平滑衰减
+        weight_kernel = get_gaussian_kernel(kernel_size=kernel_size, sigma=kernel_size/4)
+        half_k = kernel_size // 2
+
         for acq in np.unique(acq_ids):
             idx_acq = np.where(acq_ids == acq)[0]
             if idx_acq.size == 0:
@@ -537,62 +780,285 @@ def evaluate(model: nn.Module,
             targets_acq = targets[idx_acq]
             valid_acq = valid_mask[idx_acq]
 
-            # 平移到从 0 开始，并可选下采样
-            xs0 = xs_acq - xs_acq.min()
-            ys0 = ys_acq - ys_acq.min()
-            if downscale > 1:
-                xs0 = xs0 // downscale
-                ys0 = ys0 // downscale
-
-            H = int(ys0.max() + 1)
-            W = int(xs0.max() + 1)
+            # 计算画布大小 (归一化坐标到从0开始)
+            x_min, y_min = xs_acq.min(), ys_acq.min()
+            xs0 = xs_acq - x_min
+            ys0 = ys_acq - y_min
+            
+            # 画布尺寸需要留出边缘 padding，防止 kernel 越界
+            # 加大一点尺寸确保容纳所有 kernel
+            H = int(ys0.max() + kernel_size + 1)
+            W = int(xs0.max() + kernel_size + 1)
+            
             if H <= 1 or W <= 1:
                 continue
-            # import pdb
-            # pdb.set_trace()
+            
+            images_for_viz[acq] = {}
+            
+            # 遍历每个 biomarker
             for j in range(B):
                 vmask = valid_acq[:, j]
+                # 如果有效点太少，跳过
                 if vmask.sum() < 2:
                     continue
 
-                img_pred = np.zeros((H, W), dtype=np.float32)
-                img_gt = np.zeros((H, W), dtype=np.float32)
+                # 初始化累加器 (分子) 和 权重图 (分母)
+                pred_num = np.zeros((H, W), dtype=np.float32)
+                pred_den = np.zeros((H, W), dtype=np.float32)
+                
+                gt_num = np.zeros((H, W), dtype=np.float32)
+                gt_den = np.zeros((H, W), dtype=np.float32)
 
-                yj = ys0[vmask]
-                xj = xs0[vmask]
-                v_pred = preds_acq[vmask, j]
-                v_gt = targets_acq[vmask, j]
+                # 筛选出当前 acquisition + 当前 biomarker 的有效点
+                valid_indices = np.where(vmask)[0]
+                
+                # --- 核心：高斯加权累加循环 ---
+                for k in valid_indices:
+                    cx, cy = xs0[k], ys0[k]
+                    val_p = preds_acq[k, j]
+                    val_g = targets_acq[k, j]
+                    
+                    # 确定 ROI 坐标 (以点为中心放置 kernel)
+                    t = int(max(0, cy - half_k))
+                    b = int(min(H, cy + half_k))
+                    l = int(max(0, cx - half_k))
+                    r = int(min(W, cx + half_k))
+                    
+                    # 确定 kernel 的切片 (处理边缘裁剪情况)
+                    kt = int(t - (cy - half_k))
+                    kb = int(b - (cy - half_k))
+                    kl = int(l - (cx - half_k))
+                    kr = int(r - (cx - half_k))
+                    
+                    # 截取对应的 kernel
+                    curr_kernel = weight_kernel[kt:kb, kl:kr]
+                    
+                    # 累加 Pred (加权)
+                    pred_num[t:b, l:r] += val_p * curr_kernel
+                    pred_den[t:b, l:r] += curr_kernel
+                    
+                    # 累加 GT (加权)
+                    gt_num[t:b, l:r] += val_g * curr_kernel
+                    gt_den[t:b, l:r] += curr_kernel
 
-                img_pred[yj, xj] = v_pred
-                img_gt[yj, xj] = v_gt #save the gt image and pred image to compare
+                # --- 归一化 (除以权重和) ---
+                # 避免除以 0
+                pred_den = np.maximum(pred_den, 1e-8)
+                gt_den = np.maximum(gt_den, 1e-8)
+                
+                img_pred = pred_num / pred_den
+                img_gt = gt_num / gt_den
 
+                # --- 计算 SSIM ---
                 data_range = float(img_gt.max() - img_gt.min())
-                if data_range <= 0:
-                    continue
-
-                s = ssim(img_gt, img_pred, data_range=data_range)
+                # 如果 GT 是纯平的(例如全0)，SSIM 无意义，设为 0 或 1
+                if data_range <= 1e-6:
+                    s = 0.0 
+                else:
+                    s = ssim(img_gt, img_pred, data_range=data_range)
+                
                 if np.isfinite(s):
                     ssim_vals.append(s)
+                    # 保存重建好的图用于可视化
+                    images_for_viz[acq][j] = (img_pred.copy(), img_gt.copy(), s)
 
         if not ssim_vals:
-            return float('nan')
-        return float(np.mean(ssim_vals))
+            return float('nan'), {}
+            
+        return float(np.mean(ssim_vals)), images_for_viz
     
-    # import pdb
-    # pdb.set_trace()
-    # 如果觉得图像太大，可以把 downscale 改成 2 / 4
-    val_ssim = _compute_image_ssim(
-        all_preds, all_targets, all_valid, all_x, all_y, all_acq_ids, downscale=1
+    # 调用计算函数
+    # 假设你的数据生成脚本里 STRIDE = 8，这里 kernel_size 设为 16 效果最好
+    val_ssim, images_for_viz = _compute_image_ssim(
+        all_preds, all_targets, all_valid, all_x, all_y, all_acq_ids, 
+        stride=8, kernel_size=16
     )
+    
+    # ===================== 3. 保存可视化图像 (适配平滑灰度图) =====================
+    if save_visualizations and images_for_viz:
+        viz_dir = os.path.join(run_dir, 'visualizations_all_biomarkers', f'step_{step}')
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        for acq_id, acq_images in images_for_viz.items():
+            if len(acq_images) == 0:
+                continue
+            
+            # 确定要可视化的 biomarker 列表
+            if num_biomarkers_to_viz == -1:
+                biomarkers_to_viz = sorted(acq_images.keys())
+            else:
+                biomarkers_to_viz = list(range(min(num_biomarkers_to_viz, len(bm_labels))))
+            
+            valid_biomarker_indices = [j for j in biomarkers_to_viz if j in acq_images]
+            if not valid_biomarker_indices:
+                continue
+            
+            # --- 归一化辅助函数 ---
+            def normalize_img(img, p_min=1, p_max=99):
+                """基于百分位数的鲁棒归一化"""
+                if img.size == 0 or img.max() == img.min():
+                    return np.zeros_like(img)
+                # 排除背景 0 值的影响，只统计有信号的区域
+                valid_pixels = img[img > 1e-6]
+                if valid_pixels.size == 0:
+                    vmin, vmax = img.min(), img.max()
+                else:
+                    vmin = np.percentile(valid_pixels, p_min)
+                    vmax = np.percentile(valid_pixels, p_max)
+                
+                if vmax > vmin:
+                    return np.clip((img - vmin) / (vmax - vmin), 0, 1)
+                else:
+                    return np.zeros_like(img)
+
+            # 分页保存，防止图片太长
+            max_biomarkers_per_file = 10
+            num_files = (len(valid_biomarker_indices) + max_biomarkers_per_file - 1) // max_biomarkers_per_file
+            
+            for file_idx in range(num_files):
+                start_idx = file_idx * max_biomarkers_per_file
+                end_idx = min(start_idx + max_biomarkers_per_file, len(valid_biomarker_indices))
+                current_biomarkers = valid_biomarker_indices[start_idx:end_idx]
+                
+                
+                # 绘图：每行一个 biomarker，左边 Pred，右边 GT
+                fig, axes = plt.subplots(len(current_biomarkers), 2, 
+                                       figsize=(10, 4 * len(current_biomarkers)))
+                if len(current_biomarkers) == 1:
+                    axes = axes.reshape(1, -1)
+                
+                for row_idx, j in enumerate(current_biomarkers):
+                    img_pred, img_gt, ssim_val = acq_images[j]
+                    biomarker_name = bm_labels[j] if j < len(bm_labels) else f'Biomarker_{j}'
+                    
+                    # 归一化用于显示
+                    disp_pred = normalize_img(img_pred)
+                    disp_gt = normalize_img(img_gt)
+                    
+                    # Pred
+                    ax_p = axes[row_idx, 0]
+                    im1 = ax_p.imshow(disp_pred, cmap='gray', interpolation='nearest')
+                    ax_p.set_title(f'Pred: {biomarker_name}\nSSIM: {ssim_val:.3f}')
+                    ax_p.axis('off')
+                    plt.colorbar(im1, ax=ax_p, fraction=0.046, pad=0.04)
+                    
+                    # GT
+                    ax_g = axes[row_idx, 1]
+                    im2 = ax_g.imshow(disp_gt, cmap='gray', interpolation='nearest')
+                    ax_g.set_title(f'GT: {biomarker_name}')
+                    ax_g.axis('off')
+                    plt.colorbar(im2, ax=ax_g, fraction=0.046, pad=0.04)
+                
+                file_suffix = f"_part{file_idx+1}" if num_files > 1 else ""
+                plt.suptitle(f'Reconstruction: {acq_id} (Step {step})', y=0.995)
+                plt.tight_layout()
+                
+                save_path = os.path.join(viz_dir, f'{acq_id}_smooth{file_suffix}.png')
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"  已保存平滑重建图: {save_path}")
+
+            # 保存统计信息 txt
+            all_ssims = [acq_images[j][2] for j in valid_biomarker_indices]
+            avg_ssim = np.mean(all_ssims) if all_ssims else 0.0
+            with open(os.path.join(viz_dir, f'{acq_id}_stats.txt'), 'w') as f:
+                f.write(f"Average SSIM: {avg_ssim:.4f}\n")
+                for j in valid_biomarker_indices:
+                    name = bm_labels[j] if j < len(bm_labels) else str(j)
+                    f.write(f"{name}: {acq_images[j][2]:.4f}\n")
 
     return val_pr, val_ssim
+
+    
+
+
+def get_available_gpus(preferred_gpus: Optional[List[int]] = None) -> List[int]:
+    """
+    检测并返回可用的GPU设备列表。
+    会测试每个GPU是否可以正常使用，过滤掉有问题的GPU。
+    
+    Args:
+        preferred_gpus: 优先使用的GPU ID列表。如果指定，只测试这些GPU。
+    
+    Returns:
+        可用GPU设备ID的列表（相对于CUDA_VISIBLE_DEVICES的本地ID）
+    """
+    available_gpus = []
+    
+    # 检查CUDA_VISIBLE_DEVICES环境变量
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if cuda_visible:
+        print(f"检测到CUDA_VISIBLE_DEVICES={cuda_visible}")
+    
+    if not torch.cuda.is_available():
+        print("警告: torch.cuda.is_available()返回False")
+        # 即使is_available返回False，也尝试检测GPU（可能是驱动问题但GPU实际可用）
+        print("尝试强制检测GPU设备...")
+    
+    try:
+        num_gpus = torch.cuda.device_count()
+        print(f"检测到 {num_gpus} 个GPU设备")
+        
+        if num_gpus == 0:
+            print("没有检测到GPU设备")
+            return available_gpus
+        
+        # 如果指定了优先使用的GPU列表，只测试这些GPU
+        # 注意：如果设置了CUDA_VISIBLE_DEVICES，这里的ID应该是相对于可见设备的
+        if preferred_gpus is not None:
+            gpu_ids_to_test = [gpu_id for gpu_id in preferred_gpus if gpu_id < num_gpus]
+            if not gpu_ids_to_test:
+                # 如果所有preferred_gpus都超出范围，测试所有可用GPU
+                gpu_ids_to_test = list(range(num_gpus))
+                print(f"警告: 指定的GPU {preferred_gpus}超出范围，将测试所有可用GPU")
+        else:
+            gpu_ids_to_test = list(range(num_gpus))
+        
+        for gpu_id in gpu_ids_to_test:
+            try:
+                # 尝试在每个GPU上创建一个tensor来测试
+                torch.cuda.set_device(gpu_id)
+                test_tensor = torch.zeros(1).cuda(gpu_id)
+                # 尝试一个简单的计算来确保GPU真的可用
+                result = test_tensor + 1
+                del test_tensor, result
+                torch.cuda.empty_cache()
+                
+                # 获取GPU名称
+                try:
+                    gpu_name = torch.cuda.get_device_name(gpu_id)
+                except:
+                    gpu_name = "Unknown"
+                print(f"  GPU {gpu_id}: {gpu_name} - 可用 ✓")
+                available_gpus.append(gpu_id)
+                
+            except Exception as e:
+                print(f"  GPU {gpu_id}: 不可用 ✗ (错误: {str(e)})")
+                continue
+                
+    except Exception as e:
+        print(f"检测GPU时出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    
+    if available_gpus:
+        print(f"将使用以下GPU: {available_gpus}")
+    else:
+        print("没有可用的GPU，将使用CPU")
+    
+    return available_gpus
 
 
 def main():
     """Main training and evaluation function."""
     
     # Initialize wandb for experiment tracking
-    wandb.init(project='hande_to_codex', name='model_training')
+    # 增大初始化超时时间，避免代理或网络慢导致超时
+    wandb.init(
+        project='hande_to_codex',
+        name='model_training',
+        settings=wandb.Settings(init_timeout=180)
+    )
 
     # Set up data transforms
     transform_train = {
@@ -622,6 +1088,8 @@ def main():
     # Load metadata and data
     metadata_dict = pd.read_pickle(METADATA_FILE)
     data_df = pd.read_parquet(DATA_FILE)
+    # import pdb
+    # pdb.set_trace()
 
     # # --- Debug prints to inspect data and splits ---
     # print("ROOT_DIR:", ROOT_DIR)
@@ -690,8 +1158,40 @@ def main():
     # Create data loaders
     def collate_fn(batch):
         batch = list(filter(lambda x: x is not None, batch))
+        # 如果batch为空（所有样本都被过滤掉），返回None，让训练循环跳过
+        if len(batch) == 0:
+            return None
         return torch.utils.data.default_collate(batch)
 
+    # 打印数据集信息
+    print(f"\n数据集信息:")
+    print(f"  训练集大小: {len(train_dataset)}")
+    print(f"  验证集大小: {len(val_dataset)}")
+    print(f"  Batch size: {BATCH_SIZE}")
+    print(f"  Num workers: {NUM_WORKERS}")
+    
+    # 测试数据集样本有效性
+    print(f"\n检查训练数据集样本有效性:")
+    valid_samples = 0
+    invalid_samples = 0
+    for i in range(min(100, len(train_dataset))):  # 检查前100个样本
+        try:
+            sample = train_dataset[i]
+            if sample is None:
+                invalid_samples += 1
+            else:
+                valid_samples += 1
+        except Exception as e:
+            invalid_samples += 1
+            if i == 0:
+                print(f"  样本{i}加载错误: {e}")
+    
+    print(f"  前{min(100, len(train_dataset))}个样本中: 有效={valid_samples}, 无效={invalid_samples}")
+    
+    if valid_samples == 0:
+        print(f"  严重警告: 训练集中没有有效样本！")
+        print(f"  请检查数据文件路径和数据集配置")
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
@@ -699,6 +1199,23 @@ def main():
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn
     )
+    
+    # 测试DataLoader
+    print(f"\nDataLoader测试:")
+    print(f"  预计batch数量: {len(train_loader)}")
+    try:
+        # 测试获取一个batch
+        test_batch = next(iter(train_loader))
+        print(f"  成功获取batch: inputs shape={test_batch[0].shape}, labels shape={test_batch[1].shape}")
+    except StopIteration:
+        print("  错误: DataLoader为空，无法获取任何batch")
+    except RuntimeError as e:
+        if "Empty batch" in str(e):
+            print(f"  警告: 第一个batch为空（所有样本被过滤）")
+        else:
+            print(f"  错误: {e}")
+    except Exception as e:
+        print(f"  错误: 无法获取batch: {e}")
 
     val_loader = DataLoader(
         val_dataset,
@@ -709,11 +1226,32 @@ def main():
     )
 
     # Set up model and training
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = get_model(num_outputs=len(metadata_dict['all_biomarkers']))
+    # 如果设置了CUDA_VISIBLE_DEVICES，GPU ID会重新映射，所以使用None让函数自动检测所有可见GPU
+    # CUDA_VISIBLE_DEVICES已经在代码开头设置了，所以这里不需要指定preferred_gpus
+    available_gpus = get_available_gpus(preferred_gpus=None)
     
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    if available_gpus:
+        # 使用第一个可用GPU作为主设备
+        device = torch.device(f'cuda:{available_gpus[0]}')
+        print(f"✓ 使用设备: {device}")
+        
+        # 如果有多个可用GPU，使用DataParallel
+        if len(available_gpus) > 1:
+            model = get_model(num_outputs=len(metadata_dict['all_biomarkers']))
+            model = nn.DataParallel(model, device_ids=available_gpus)
+            print(f"✓ 使用DataParallel，GPU设备: {available_gpus}")
+        else:
+            model = get_model(num_outputs=len(metadata_dict['all_biomarkers']))
+            # 确保模型在正确的GPU上
+            torch.cuda.set_device(available_gpus[0])
+            print(f"✓ 使用单GPU: {available_gpus[0]}")
+    else:
+        # 没有可用GPU，使用CPU
+        device = torch.device('cpu')
+        print("⚠️  警告: 没有可用的GPU，将在CPU上运行（训练速度会很慢）")
+        print("   建议检查CUDA驱动和PyTorch CUDA版本是否匹配")
+        print(f"   PyTorch版本: {torch.__version__}")
+        model = get_model(num_outputs=len(metadata_dict['all_biomarkers']))
     
     model = model.to(device)
     
@@ -772,7 +1310,9 @@ def main():
                 val_r2, val_ssim = evaluate(
                     model, val_loader, device, 
                     os.path.join(ROOT_DIR, 'runs'), 
-                    step, metadata_dict['all_biomarkers']
+                    step, metadata_dict['all_biomarkers'],
+                    save_visualizations=True,
+                    num_biomarkers_to_viz=-1  # -1表示可视化所有biomarker，或指定数量如6
                 )
 
                 # 防止 NaN 影响 early stopping 和 scheduler
@@ -806,6 +1346,8 @@ def main():
                 if steps_since_best_val_score >= PATIENCE:
                     print(f'Early stopping after {step} steps')
                     return
+
+                model.train()
 
             step += 1
 

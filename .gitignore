@@ -14,3 +14,5 @@
 !hub/models--ericwu09--ROSIE/snapshots/main/reconstruct_codex.py
 !hub/models--ericwu09--ROSIE/snapshots/main/train.py
 !hub/models--ericwu09--ROSIE/snapshots/main/utils.py
+!hub/models--ericwu09--ROSIE/snapshots/main/run_preprocess.py
+!hub/models--ericwu09--ROSIE/snapshots/main/preprocess.py
