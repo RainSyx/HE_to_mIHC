@@ -16,6 +16,7 @@
 !hub/models--ericwu09--ROSIE/snapshots/main/utils.py
 !hub/models--ericwu09--ROSIE/snapshots/main/run_preprocess.py
 !hub/models--ericwu09--ROSIE/snapshots/main/preprocess.py
-!hub/models--ericwu09--ROSIE/snapshots/main/convert_qptiff_to_ometiff.py
-!hub/models--ericwu09--ROSIE/snapshots/main/run_valis_register.py
+!VALIS/run_valis_register.py
 !VALIS/visualize_valis_fast.py
+!VALIS/convert_qptiff_to_ometiff.py
+!VALIS/convert_png_to_ometiff.py
